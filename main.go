@@ -14,20 +14,29 @@
 package main
 
 import (
-	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
+	"time"
 
+	"github.com/heroku/metaas/v2/api/client"
+	"github.com/heroku/metaas/v2/schema"
 	"github.com/matttproud/golang_protobuf_extensions/pbutil"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/log"
 
 	dto "github.com/prometheus/client_model/go"
 )
+
+var skipLabels = map[string]bool{
+	"handler": true,
+}
 
 const acceptHeader = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3`
 
@@ -56,6 +65,65 @@ type histogram struct {
 	Buckets map[string]string `json:"buckets,omitempty"`
 	Count   string            `json:"count"`
 	Sum     string            `json:"sum"`
+}
+
+func newObservation(ts time.Time, dtoMF *dto.MetricFamily) *schema.Observation {
+	name := dtoMF.GetName()
+	obs := &schema.Observation{
+		Timestamp:    ts.Unix(),
+		Measurements: &schema.Measurements{},
+	}
+
+	switch dtoMF.GetType() {
+	case dto.MetricType_GAUGE:
+		obs.Type = schema.MetricType_GAUGE
+		obs.Measurements.Names = make([]string, len(dtoMF.Metric))
+		obs.Measurements.Values = make([]float64, len(dtoMF.Metric))
+
+		for idx, m := range dtoMF.Metric {
+			obs.Measurements.Names[idx] = name + suffixFor(m)
+			obs.Measurements.Values[idx] = getValue(m)
+		}
+		return obs
+
+	case dto.MetricType_COUNTER:
+		obs.Type = schema.MetricType_COUNTER
+		obs.Measurements.Names = make([]string, len(dtoMF.Metric))
+		obs.Measurements.Values = make([]float64, len(dtoMF.Metric))
+
+		for idx, m := range dtoMF.Metric {
+			obs.Measurements.Names[idx] = name + suffixFor(m)
+			obs.Measurements.Values[idx] = getValue(m)
+		}
+
+		return obs
+
+	case dto.MetricType_SUMMARY:
+		obs.Type = schema.MetricType_GAUGE
+
+		for _, m := range dtoMF.Metric {
+			suffix := suffixFor(m)
+
+			obs.Measurements.Names = append(obs.Measurements.Names, name+suffix+"_count")
+			obs.Measurements.Values = append(obs.Measurements.Values, float64(m.GetSummary().GetSampleCount()))
+
+			obs.Measurements.Names = append(obs.Measurements.Names, name+suffix+"_sum")
+			obs.Measurements.Values = append(obs.Measurements.Values, m.GetSummary().GetSampleSum())
+
+			for _, q := range m.GetSummary().Quantile {
+				obs.Measurements.Names = append(obs.Measurements.Names, name+suffix+"_p"+strconv.Itoa(int(100*q.GetQuantile())))
+				obs.Measurements.Values = append(obs.Measurements.Values, q.GetValue())
+			}
+		}
+
+		return obs
+
+	case dto.MetricType_HISTOGRAM:
+		log.Println("Skipping HISTOGRAM")
+	case dto.MetricType_UNTYPED:
+		log.Println("Skipping UNTYPED")
+	}
+	return nil
 }
 
 func newMetricFamily(dtoMF *dto.MetricFamily) *metricFamily {
@@ -101,6 +169,22 @@ func getValue(m *dto.Metric) float64 {
 		return m.GetUntyped().GetValue()
 	}
 	return 0.
+}
+
+func suffixFor(m *dto.Metric) string {
+	result := make([]string, 0, len(m.Label))
+
+	for _, lp := range m.Label {
+		if skipLabels[lp.GetName()] {
+			continue
+		}
+		result = append(result, lp.GetName()+"_"+lp.GetValue())
+	}
+
+	if len(result) == 0 {
+		return ""
+	}
+	return "_" + strings.Join(result, "_")
 }
 
 func makeLabels(m *dto.Metric) map[string]string {
@@ -172,26 +256,47 @@ func fetchMetricFamilies(url string, ch chan<- *dto.MetricFamily) {
 	}
 }
 
+var (
+	scrapeURL = flag.String("scrape-url", "", "Scrape URL")
+	sinkURL   = flag.String("url", "", "Destination URL")
+	instance  = flag.String("instance", "", "Instance label to utilize")
+	interval  = flag.Int("interval", 5, "Default interval for waiting between posts")
+)
+
 func main() {
+	// Limit processing power to max 2 CPUs.
 	runtime.GOMAXPROCS(2)
-	if len(os.Args) != 2 {
-		log.Fatalf("Usage: %s METRICS_URL", os.Args[0])
+
+	flag.Parse()
+
+	if *sinkURL == "" || *scrapeURL == "" || *instance == "" {
+		flag.Usage()
+		os.Exit(2)
 	}
 
-	mfChan := make(chan *dto.MetricFamily, 1024)
+	interval := time.Second * time.Duration(*interval)
+	timer := time.NewTimer(interval)
 
-	go fetchMetricFamilies(os.Args[1], mfChan)
+	for {
+		select {
+		case <-timer.C:
+			mfChan := make(chan *dto.MetricFamily, 1024)
+			go fetchMetricFamilies(*scrapeURL, mfChan)
 
-	result := []*metricFamily{}
-	for mf := range mfChan {
-		result = append(result, newMetricFamily(mf))
+			now := time.Now()
+			var observations []*schema.Observation
+			for mf := range mfChan {
+				if o := newObservation(now, mf); o != nil {
+					observations = append(observations, o)
+				}
+			}
+
+			c := client.New(*sinkURL)
+			err := c.PostObservations(&schema.Observations{Observations: observations}, client.Opts{Dyno: *instance})
+			if err != nil {
+				log.Printf("err=%s", err)
+			}
+		}
+		timer.Reset(interval)
 	}
-	json, err := json.Marshal(result)
-	if err != nil {
-		log.Fatalln("error marshaling JSON:", err)
-	}
-	if _, err := os.Stdout.Write(json); err != nil {
-		log.Fatalln("error writing to stdout:", err)
-	}
-	fmt.Println()
 }
